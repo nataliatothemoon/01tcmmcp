@@ -1,0 +1,165 @@
+# Build plan: TCM skin-consultation MCP (new repo)
+
+The old repo `tcmdiagnosticmcp` stays as it is. Nothing in this plan edits, imports from, or pushes to it. It has uncommitted, untested edits from my last pass at a story flow. I'm leaving those alone, so they stay local and unpushed unless you decide otherwise.
+
+**How the work is split.** The MCP server holds the visit's state and its rules: which probe is pending, coverage, the tangent budget, and stage order. The chat model holds the conversation itself: wording, empathy, and pulling details out of what the person says. Each person's message costs one tool call, so turns stay fast.
+
+**Marked INPUT (Natalia supplies):** the mandatory probes for each condition, the TCM diagnostic categories, and the cited sources. Until those arrive, the repo uses clearly labeled placeholder probes.
+
+---
+
+## Phase 0: Repo setup
+
+1. Create a new GitHub repo, for example `tcm-skin-consult`. Clone it to a separate folder.
+2. Stack: Python 3.11+, the official `mcp` SDK (`MCPServer`), SQLite, and pytest. This is the same stack that already works on your machine.
+3. Layout:
+   - `src/consult/`: `server.py`, `visit.py` (state and rules), `report.py`, `store.py`, `scanners/`
+   - `content/`: `probes/eczema.yaml` (INPUT), `categories.yaml` (INPUT), `sources.yaml` (INPUT)
+   - `tests/fixtures/fake_eczema_visit.json`
+   - `install.py` (one command, same idea as before)
+4. Privacy rules carried over: name and email go only to a private database. The case files have no contact details, and photos stay local.
+
+**Done when:** `pytest` runs an empty suite, and Cursor lists the server with no tools yet.
+
+---
+
+## Phase 1: Conversation loop (build first)
+
+### 1.1 System prompt
+
+Ship it as the server `instructions` and as an MCP prompt named `consult`. It covers:
+
+- **(a) Fixed script.** Mandatory direct probes are never skipped. Ask each one plainly, one at a time, when the server marks it pending.
+- **(b) Coverage tracker.** The server returns what is covered and what remains on every turn. The model must not invent coverage.
+- **(c) Free response.** Follow the person's tangents, draw out the details relevant to the case, and steer back to the pending probe after the server's budget is used up.
+- **Tone.** A caring, knowledgeable skin specialist: reflect back what was heard in the person's own words, then ask.
+- **Guardrails.**
+  - On every turn, split the person's message into an answer to the pending probe and volunteered context.
+  - Material that isn't about the pending probe is always tagged as context.
+  - Don't invent probes, patterns, points, or herbs.
+
+### 1.2 Probe script format
+
+`content/probes/eczema.yaml` (INPUT) uses this shape:
+
+```yaml
+condition: eczema
+placeholder: true          # report prints a banner while true
+stages: [intake, tongue, condition]
+probes:
+  - id: intake_age
+    stage: intake
+    mandatory: true
+    ask: "How old are you?"
+    values: free_text       # or a list of allowed levels
+  - id: ecz_fatigue
+    stage: condition
+    mandatory: true
+    ask: "PLACEHOLDER - Natalia supplies"
+    values: [none, mild, moderate, severe, unsure]
+    category: null          # INPUT: maps to a TCM category later
+```
+
+### 1.3 Visit state (`visit.py`)
+
+- Stage order: intake, then tongue, then condition. The visit cannot move to the next stage while a mandatory probe in the current stage is open.
+- `pending_probe` holds exactly one probe at a time.
+- Each thread has a follow-up counter. `TANGENT_BUDGET = 3` is configurable.
+- Answer validation:
+  - An answer is accepted only if its `probe_id` matches `pending_probe`. Anything else is rejected with an error.
+  - Every answer must include the exact user words.
+  - `unsure` and `declined` are valid answers. Silence is not.
+
+### 1.4 Tools (three only)
+
+- `start_visit(condition, name, email)` opens a visit and returns the first thing to say.
+- `next_turn(visit_id, answer?, context[], follow_thread?)` is the one next-question tool. It takes:
+  - `answer`: `{probe_id, verbatim, value}`
+  - `context` items: `{verbatim, cleaned, thread, category|null}`
+  - It returns `{say, mode: probe|follow|steer_back, pending_probe, covered, remaining, tangent_left}`.
+  - Server rule: if `follow_thread` still has budget, return `follow`. Otherwise return `steer_back`, with the pending probe's exact wording.
+- `write_report(visit_id)` is a stub at this stage. It refuses to run while any mandatory probe is open.
+
+### 1.5 Stub report writer
+
+It prints the three tiers as plain sections, with no pattern analysis yet. The tiers are spelled out in Phase 2.
+
+### 1.6 One fake eczema visit, end to end
+
+1. Script a fixture transcript of about 20 turns. It includes:
+   - two tangents, one of which runs past the budget
+   - one message that is pure context while a probe is pending
+   - one `unsure` answer
+2. The test replays the fixture through `visit.py` and asserts:
+   - every mandatory probe has an answer with verbatim words
+   - no thread gets more than 3 follow-ups
+   - the context-only message did not fill the pending probe
+   - the report has all three tiers, with the exact words present
+3. Run the same visit live in Cursor with a fake-patient prompt. Confirm one tool call per turn and acceptable latency.
+
+**Done when:** the fixture test passes and a live fake visit reaches a report without the chat calling Python directly.
+
+---
+
+## Phase 2: The three-tier report
+
+1. **Structured findings.** One row per probe: the probe, the chosen value, and the person's exact words.
+2. **Narrative.** The volunteered context in chronological order, built from the `cleaned` text. The verbatim text is kept alongside it in the data.
+3. **Flags.** Context items with `category: null`, listed as uncategorized observations for review.
+4. Placeholder banner while `placeholder: true`.
+5. The de-identified case JSON stores all three tiers. A test asserts that no name or email appears in it.
+
+**Done when:** the fixture report has all three tiers, the banner shows, and the privacy test passes.
+
+---
+
+## Phase 3: Visit flow wired
+
+1. Intake stage: demographic probes (age, sex, date). Name and email are collected at `start_visit` and go to the private database only.
+2. Tongue stage: a text placeholder probe ("describe your tongue") until Phase 4.
+3. Condition stage: the mandatory probes mixed with open elaboration, using the Phase 1 rules.
+
+**Done when:** a live visit always goes demographics, then tongue, then condition, and can't skip ahead.
+
+---
+
+## Phase 4: Tongue scanner plugin
+
+1. Interface in `scanners/base.py`:
+
+```python
+class TongueScanner(Protocol):
+    name: str
+    def request(self, visit) -> ScanRequest: ...   # text to show, link, what to paste back
+    def ingest(self, visit, raw: str, image_path: str | None) -> TongueReading: ...
+```
+
+2. Default adapter `scanners/google_ai_mode.py`:
+   - `request` returns a ready-to-paste TCM tongue-reading prompt and a link that opens Google AI Mode. The person uploads the photo there.
+   - `ingest` stores the pasted result word for word. The model maps it onto the tongue fields, which are INPUT from `categories.yaml`.
+   - Limit: Google AI Mode has no API, so the person does the upload and paste. The result is stored as unverified text plus the mapped fields.
+   - The terms say the photo goes to Google.
+3. Selected by config (`scanner: google_ai_mode`). A future `scanners/custom.py` implements the same two methods. Nothing else changes.
+4. A new tool, `scan_tongue(visit_id, raw?, image_path?)`, replaces the Phase 3 placeholder probe.
+
+**Done when:** the fake visit runs with the AI Mode handoff, and a stub `custom` scanner passes the same test.
+
+---
+
+## Phase 5: Natalia's inputs
+
+1. Replace the placeholder probes with the real eczema probes, and set `placeholder: false`.
+2. Add `categories.yaml` with the TCM diagnostic categories and their sources.
+3. Map probes and tongue fields to categories. Only then add pattern analysis to the report, cited from `sources.yaml`.
+4. Re-run the fixture with the real probes, plus one new fake visit.
+
+**Done when:** the report shows no placeholder banner and every category claim has a source.
+
+---
+
+## Phase 6: Install and friend test
+
+1. Run `install.py` for Cursor, Claude Desktop, VS Code, Windsurf, and Codex / ChatGPT desktop.
+2. Test from a fresh clone in a separate Cursor window with a new Agent chat. The first message should ask for demographics, not jump to questions.
+
+**Done when:** a friend completes a visit from a fresh clone without help.
